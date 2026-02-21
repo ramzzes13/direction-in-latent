@@ -1,0 +1,50 @@
+model:
+  model_id: "google/ddpm-celebahq-256"
+  torch_dtype: "float16"
+  device: "auto"
+
+sampler:
+  num_inference_steps: 50
+  eta: 1.0
+
+discovery:
+  num_samples: 500
+  num_components: 20
+  ipca_batch_size: 50
+  seed_start: 0
+
+edit:
+  num_directions: 10
+  num_seeds_per_direction: 5
+  default_alpha: 5.0
+  alpha_values: [3.0, 5.0, 7.0]
+  edit_seeds: [42, 123, 256, 789, 1024]
+
+labeling:
+  clip_model_name: "ViT-B-32"
+  clip_pretrained: "openai"
+  attribute_list:
+    - "a face rotated to the left"
+    - "a face rotated to the right"
+    - "a smiling person"
+    - "a frowning person"
+    - "a male person"
+    - "a female person"
+    - "a person wearing glasses"
+    - "a person without glasses"
+    - "an older person"
+    - "a younger person"
+    - "a person with blonde hair"
+    - "a person with dark hair"
+    - "a bald person"
+    - "a person with long hair"
+    - "a person with bangs"
+    - "a person with a hat"
+    - "a person with eyes closed"
+    - "a person with eyes open"
+    - "a person with mouth open"
+    - "a person with mouth closed"
+  vlm_model_name: "Salesforce/blip2-opt-2.7b"
+  vlm_prompt: "Question: What is the main visual difference between the left face and the right face? Answer in one or two words. Answer:"
+
+output_dir: "outputs"
