@@ -1,7 +1,8 @@
 """Stage 3: Automated labeling using CLIP and VLM approaches."""
 
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+from collections import Counter
 
 import torch
 import numpy as np
@@ -12,6 +13,14 @@ from src.config import LabelingConfig
 from src.utils import save_json, free_gpu_memory
 
 
+# Stop words to ignore in VLM caption differencing
+_STOP_WORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "of", "in", "on", "at",
+    "to", "for", "and", "or", "but", "with", "by", "from", "this", "that",
+    "it", "its", "his", "her", "their", "my", "your",
+}
+
+
 class CLIPLabeler:
     """
     Approach A: CLIP zero-shot classification of semantic changes.
@@ -19,7 +28,9 @@ class CLIPLabeler:
     For each direction, computes:
     delta_S(attr) = mean over seeds of [CLIP(I_pos, text) - CLIP(I_neg, text)]
 
-    Assigns the attribute with highest positive delta_S.
+    Uses logit-scaled cosine similarity for more meaningful scores.
+    Also uses paired attribute detection (e.g., "smiling" vs "frowning")
+    to identify bidirectional changes.
     """
 
     def __init__(self, config: LabelingConfig, device: str):
@@ -28,6 +39,7 @@ class CLIPLabeler:
         self.model = None
         self.preprocess = None
         self.tokenizer = None
+        self.logit_scale = 1.0
 
     def load_model(self):
         """Load CLIP model (open_clip) in fp16."""
@@ -41,7 +53,9 @@ class CLIPLabeler:
         self.tokenizer = open_clip.get_tokenizer(self.config.clip_model_name)
         self.model = self.model.half()
         self.model.eval()
-        print(f"CLIP model loaded on {self.device}")
+        # Extract learned logit scale for amplifying cosine similarities
+        self.logit_scale = self.model.logit_scale.exp().item()
+        print(f"CLIP model loaded on {self.device} (logit_scale={self.logit_scale:.1f})")
 
     def unload_model(self):
         """Unload CLIP model from GPU."""
@@ -58,12 +72,8 @@ class CLIPLabeler:
         """
         For each direction, compute CLIP similarity delta for all attributes.
 
-        Args:
-            edit_metadata: Stage 2 output with 'edits' list
-            output_dir: Base output directory
-
-        Returns:
-            Dict mapping direction index to scores and labels.
+        Uses logit-scaled similarities and selects the attribute with
+        highest absolute delta (detecting both positive and negative changes).
         """
         attributes = self.config.attribute_list
 
@@ -95,13 +105,32 @@ class CLIPLabeler:
 
             # Average across seeds
             mean_delta = np.mean(all_deltas, axis=0)
-            top_idx = int(np.argmax(mean_delta))
+            std_delta = np.std(all_deltas, axis=0)
+
+            # Select by highest absolute delta (detects both + and - changes)
+            abs_delta = np.abs(mean_delta)
+            top_idx = int(np.argmax(abs_delta))
+
+            # Also find top positive and top negative labels
+            top_pos_idx = int(np.argmax(mean_delta))
+            top_neg_idx = int(np.argmin(mean_delta))
 
             results[f"direction_{k}"] = {
                 "scores": {attr: float(mean_delta[i])
                            for i, attr in enumerate(attributes)},
+                "scores_std": {attr: float(std_delta[i])
+                               for i, attr in enumerate(attributes)},
                 "top_label": attributes[top_idx],
                 "top_score": float(mean_delta[top_idx]),
+                "top_abs_score": float(abs_delta[top_idx]),
+                "top_positive": {
+                    "label": attributes[top_pos_idx],
+                    "score": float(mean_delta[top_pos_idx]),
+                },
+                "top_negative": {
+                    "label": attributes[top_neg_idx],
+                    "score": float(mean_delta[top_neg_idx]),
+                },
                 "per_seed_deltas": [
                     {attr: float(d[i]) for i, attr in enumerate(attributes)}
                     for d in all_deltas
@@ -118,8 +147,8 @@ class CLIPLabeler:
         text_features: torch.Tensor,
     ) -> np.ndarray:
         """
-        Compute CLIP(I_pos, text) - CLIP(I_neg, text) for each text.
-        Returns array of cosine similarity deltas.
+        Compute logit-scaled CLIP similarity delta.
+        Returns: logit_scale * (cos_sim(pos, text) - cos_sim(neg, text))
         """
         img_pos_tensor = self.preprocess(img_pos).unsqueeze(0).to(self.device).half()
         img_neg_tensor = self.preprocess(img_neg).unsqueeze(0).to(self.device).half()
@@ -129,19 +158,27 @@ class CLIPLabeler:
         pos_features = pos_features / pos_features.norm(dim=-1, keepdim=True)
         neg_features = neg_features / neg_features.norm(dim=-1, keepdim=True)
 
-        pos_sim = (pos_features @ text_features.T).squeeze(0).cpu().numpy()
-        neg_sim = (neg_features @ text_features.T).squeeze(0).cpu().numpy()
+        # Apply logit scale for more meaningful scores
+        pos_sim = (self.logit_scale * pos_features @ text_features.T).squeeze(0).cpu().numpy()
+        neg_sim = (self.logit_scale * neg_features @ text_features.T).squeeze(0).cpu().numpy()
 
         return pos_sim - neg_sim
 
 
 class VLMLabeler:
     """
-    Approach B: VLM difference captioning.
+    Approach B: VLM difference captioning using BLIP-2.
 
-    Creates a side-by-side composite of I_neg and I_pos,
-    then prompts a VLM to describe the difference.
+    Strategy: Caption positive and negative images with targeted VQA prompts,
+    then analyze differences across captions to identify the semantic change.
     """
+
+    # VQA prompts targeting specific facial attributes
+    VQA_PROMPTS = [
+        "Question: Describe this person's appearance briefly. Answer:",
+        "Question: What stands out about this person's face? Answer:",
+        "Question: Describe the hair, expression, and accessories. Answer:",
+    ]
 
     def __init__(self, config: LabelingConfig, device: str):
         self.config = config
@@ -188,11 +225,9 @@ class VLMLabeler:
 
     def caption_directions(self, edit_metadata: Dict, output_dir: str) -> Dict:
         """
-        For each direction, create composite image and generate caption.
-
-        Returns dict with captions per direction and seed.
+        For each direction, use multiple VQA prompts on positive and negative
+        images, then analyze differences to determine the semantic change.
         """
-        # Group edits by direction
         edits_by_dir = {}
         for e in edit_metadata["edits"]:
             k = e["direction_idx"]
@@ -203,58 +238,105 @@ class VLMLabeler:
         results = {}
 
         for k in tqdm(sorted(edits_by_dir.keys()), desc="VLM captioning"):
-            captions = []
+            all_captions = []  # list of (neg_caption, pos_caption) per seed
 
             for e in edits_by_dir[k]:
                 img_pos = Image.open(os.path.join(output_dir, e["pos_path"]))
                 img_neg = Image.open(os.path.join(output_dir, e["neg_path"]))
 
-                composite = self._create_composite(img_neg, img_pos)
-                caption = self._generate_caption(composite)
-                captions.append(caption)
+                # Use multiple prompts and collect all captions
+                neg_caps = []
+                pos_caps = []
+                for prompt in self.VQA_PROMPTS:
+                    neg_caps.append(self._caption_vqa(img_neg, prompt))
+                    pos_caps.append(self._caption_vqa(img_pos, prompt))
+
+                neg_combined = " | ".join(neg_caps)
+                pos_combined = " | ".join(pos_caps)
+                all_captions.append((neg_combined, pos_combined))
+
+            # Analyze differences
+            consensus = self._analyze_differences(all_captions)
+            caption_strings = [f"{neg} -> {pos}" for neg, pos in all_captions]
 
             results[f"direction_{k}"] = {
-                "captions": captions,
-                "consensus_label": self._get_consensus(captions),
+                "captions": caption_strings,
+                "neg_captions": [neg for neg, _ in all_captions],
+                "pos_captions": [pos for _, pos in all_captions],
+                "consensus_label": consensus,
             }
 
         return results
 
-    def _create_composite(
-        self, img_neg: Image.Image, img_pos: Image.Image
-    ) -> Image.Image:
-        """Create side-by-side image for VLM input."""
-        w, h = img_neg.size
-        composite = Image.new("RGB", (w * 2 + 10, h), color=(255, 255, 255))
-        composite.paste(img_neg, (0, 0))
-        composite.paste(img_pos, (w + 10, 0))
-        return composite
-
     @torch.no_grad()
-    def _generate_caption(self, composite: Image.Image) -> str:
-        """Run VLM inference on composite image."""
+    def _caption_vqa(self, image: Image.Image, prompt: str) -> str:
+        """Run VQA on a single image with a specific prompt."""
         inputs = self.processor(
-            images=composite,
-            text=self.config.vlm_prompt,
+            images=image,
+            text=prompt,
             return_tensors="pt",
         )
-        # Move to model device
         inputs = {k: v.to(self.model.device) if hasattr(v, 'to') else v
                   for k, v in inputs.items()}
         if self.model.device.type != "cpu":
             inputs = {k: v.half() if hasattr(v, 'half') and v.dtype == torch.float32 else v
                       for k, v in inputs.items()}
 
-        output_ids = self.model.generate(**inputs, max_new_tokens=20)
-        caption = self.processor.decode(output_ids[0], skip_special_tokens=True).strip()
+        output_ids = self.model.generate(**inputs, max_new_tokens=40)
+        # Decode only newly generated tokens (skip the input prompt tokens)
+        input_len = inputs.get("input_ids", torch.empty(0)).shape[-1] if "input_ids" in inputs else 0
+        if input_len > 0 and output_ids.shape[1] > input_len:
+            new_tokens = output_ids[0, input_len:]
+        else:
+            new_tokens = output_ids[0]
+        caption = self.processor.decode(new_tokens, skip_special_tokens=True).strip()
         return caption
 
-    def _get_consensus(self, captions: List[str]) -> str:
-        """Get most common caption as consensus label."""
-        from collections import Counter
-        # Normalize captions
-        normalized = [c.lower().strip().rstrip(".") for c in captions]
-        if not normalized:
-            return ""
-        counter = Counter(normalized)
-        return counter.most_common(1)[0][0]
+    def _analyze_differences(
+        self, all_captions: List[Tuple[str, str]]
+    ) -> str:
+        """
+        Analyze caption pairs to find consistent differences.
+        Returns a human-readable summary of the change.
+        """
+        words_gained = Counter()  # words appearing more in pos
+        words_lost = Counter()    # words appearing more in neg
+
+        for neg_text, pos_text in all_captions:
+            neg_words = self._extract_content_words(neg_text)
+            pos_words = self._extract_content_words(pos_text)
+
+            for w in pos_words - neg_words:
+                words_gained[w] += 1
+            for w in neg_words - pos_words:
+                words_lost[w] += 1
+
+        # Filter to words appearing in at least 2 seed comparisons
+        min_count = max(1, len(all_captions) // 3)
+        gained = [(w, c) for w, c in words_gained.most_common(10) if c >= min_count]
+        lost = [(w, c) for w, c in words_lost.most_common(10) if c >= min_count]
+
+        parts = []
+        if gained:
+            parts.append("+" + ", ".join(w for w, _ in gained[:5]))
+        if lost:
+            parts.append("-" + ", ".join(w for w, _ in lost[:5]))
+
+        if parts:
+            return " / ".join(parts)
+
+        # Fallback: just note if captions are identical
+        identical = sum(1 for n, p in all_captions if n.lower() == p.lower())
+        if identical == len(all_captions):
+            return "(no detectable difference)"
+        return "(subtle difference)"
+
+    @staticmethod
+    def _extract_content_words(text: str) -> set:
+        """Extract meaningful content words from caption text."""
+        words = set()
+        for w in text.lower().replace("|", " ").replace(",", " ").split():
+            w = w.strip(".,!?;:'\"()[]")
+            if w and w not in _STOP_WORDS and len(w) > 1:
+                words.add(w)
+        return words
