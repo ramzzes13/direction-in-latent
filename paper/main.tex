@@ -1,0 +1,558 @@
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+
+\usepackage{hyperref}
+
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+\usepackage[accepted]{icml2025}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{url}
+
+\icmltitlerunning{Automated Labeling of Semantic Directions in Diffusion Model Latent Spaces}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{Automated Labeling of Semantic Directions\\in Diffusion Model Latent Spaces}
+
+\begin{icmlauthorlist}
+\icmlauthor{Roman Mekashirskiy}{yyy}
+\end{icmlauthorlist}
+
+\icmlaffiliation{yyy}{Independent Researcher}
+
+\icmlcorrespondingauthor{Roman Mekashirskiy}{mekashirskiy@example.com}
+
+\icmlkeywords{Diffusion Models, Semantic Directions, CLIP, PCA, Latent Space, Automated Labeling}
+
+\vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Unsupervised methods such as PCA applied to the bottleneck activations ($h$-space) of diffusion models reveal interpretable semantic directions that control facial attributes like pose, gender, and hair style.
+However, these directions remain unlabeled: a human must visually inspect edited images to assign meaning.
+We propose a fully automated pipeline that discovers $h$-space directions via Incremental PCA and labels them using CLIP zero-shot classification and BLIP-2 visual question answering.
+On a DDPM trained on CelebA-HQ, our CLIP-based approach assigns semantically meaningful labels to the top 10 principal components with a mean confidence score of $|\Delta S| = 0.47$ (logit-scaled).
+We find that deterministic DDIM sampling ($\eta{=}0$) produces $2.1\times$ higher labeling confidence than stochastic DDPM ($\eta{=}1$), though at the cost of reduced label diversity due to attribute entanglement.
+We further characterize the sensitivity of labeling confidence to edit strength $\alpha$ and propose a specific-label heuristic that mitigates gender-attribute entanglement.
+Code is available at \url{https://github.com/ramzzes13/direction-in-latent}.
+\end{abstract}
+
+%% ============================================================
+\section{Introduction}
+\label{sec:intro}
+%% ============================================================
+
+Denoising Diffusion Probabilistic Models~\citep{ho2020denoising} generate high-quality images by iteratively denoising Gaussian noise through a learned reverse process.
+A growing body of work has shown that the internal representations of these models---particularly the bottleneck activations of the U-Net architecture---encode rich semantic structure~\citep{kwon2023diffusion, haas2024discovering}.
+\citet{haas2024discovering} demonstrated that applying Principal Component Analysis (PCA) to the so-called $h$-space (U-Net bottleneck activations collected across multiple generation runs) yields disentangled editing directions: adding a scaled principal component $\alpha \cdot v_k$ to the bottleneck activations during generation modifies a specific facial attribute such as pose, gender, or lighting.
+
+A fundamental limitation of this unsupervised approach is that the discovered directions carry no semantic labels.
+As~\citet{haas2024discovering} note, ``their effects must be interpreted manually''---a human must generate positive and negative edits, visually compare them, and assign a textual description.
+This manual interpretation is subjective, time-consuming, and inherently unscalable: it becomes impractical when analyzing hundreds of directions or when applying the method to new datasets and models.
+
+This problem parallels the earlier challenge in GAN latent space analysis, where methods like GANSpace~\citep{harkonen2020ganspace} and SeFa~\citep{shen2021closed} similarly produce unlabeled directions.
+Solutions in the GAN setting have relied either on pre-trained attribute classifiers trained on labeled data~\citep{shen2020interpreting} or on manual inspection~\citep{voynov2020unsupervised}.
+Neither approach transfers directly to diffusion models without adaptation.
+
+We address this gap by proposing an automated labeling pipeline that takes a pre-trained diffusion model, discovers latent directions via Incremental PCA, generates positive/negative edit pairs, and automatically assigns textual labels using two complementary strategies:
+\begin{enumerate}
+    \item \textbf{CLIP zero-shot classification}: We measure the change in CLIP~\citep{radford2021learning} similarity between edited images and a predefined attribute vocabulary. The attribute with the largest absolute similarity delta is assigned as the label.
+    \item \textbf{VLM difference captioning}: We use BLIP-2~\citep{li2023blip2} visual question answering to independently describe positive and negative images, then analyze the textual differences to produce an open-ended label.
+\end{enumerate}
+
+Our contributions are:
+\begin{itemize}
+    \item A complete, open-source pipeline that automates the discovery-to-labeling workflow for $h$-space directions in diffusion models.
+    \item Quantitative analysis of CLIP-based labeling across 10 principal components, including per-seed consistency, edit strength sensitivity, and the effect of sampling stochasticity ($\eta$).
+    \item A specific-label heuristic that addresses the gender-attribute entanglement problem observed in CelebA-HQ directions.
+    \item Qualitative evaluation of VLM-based open-ended labeling as a complement to fixed-vocabulary classification.
+\end{itemize}
+
+
+%% ============================================================
+\section{Related Work}
+\label{sec:related}
+%% ============================================================
+
+\paragraph{Diffusion models.}
+Denoising Diffusion Probabilistic Models (DDPMs)~\citep{ho2020denoising} define a forward process that gradually adds Gaussian noise to data and a learned reverse process that denoises it.
+Denoising Diffusion Implicit Models (DDIMs)~\citep{song2021denoising} generalize this to a family of non-Markovian processes parameterized by $\eta$, where $\eta{=}0$ yields deterministic sampling and $\eta{=}1$ recovers stochastic DDPM.
+\citet{song2021score} unify diffusion models under the framework of score-based stochastic differential equations.
+\citet{dhariwal2021diffusion} demonstrate that diffusion models surpass GANs on image synthesis benchmarks.
+Latent Diffusion Models~\citep{rombach2022high} apply the diffusion process in a compressed latent space for computational efficiency.
+
+\paragraph{Semantic latent spaces in diffusion models.}
+\citet{kwon2023diffusion} identify an asymmetric reverse process (Asyrp) that reveals a semantic latent space ($h$-space) in unconditional diffusion models.
+\citet{haas2024discovering} extend this by applying PCA to bottleneck activations collected over many generation runs, showing that the resulting principal components correspond to interpretable editing directions.
+Text-guided approaches such as DiffusionCLIP~\citep{kim2022diffusionclip}, Prompt-to-Prompt~\citep{hertz2023prompt}, and Imagic~\citep{kawar2023imagic} achieve semantic editing through text conditioning, but require specifying the desired attribute in advance rather than discovering it.
+
+\paragraph{GAN latent space analysis.}
+GANSpace~\citep{harkonen2020ganspace} applies PCA to intermediate GAN activations to find interpretable directions---the direct ancestor of the $h$-space PCA approach.
+SeFa~\citep{shen2021closed} obtains editing directions via closed-form factorization of the generator's weight matrix.
+InterFaceGAN~\citep{shen2020interpreting} uses pre-trained binary attribute classifiers to find linear boundaries in GAN latent spaces that separate attribute values, enabling targeted editing but requiring labeled training data.
+\citet{voynov2020unsupervised} train a direction reconstructor network for unsupervised direction discovery.
+All of these methods either require labeled data for training classifiers or rely on manual interpretation of the discovered directions.
+
+\paragraph{Vision-language models for image understanding.}
+CLIP~\citep{radford2021learning} learns a joint embedding space for images and text through contrastive pre-training on 400M image-text pairs, enabling zero-shot classification by comparing image embeddings to text embeddings of candidate labels.
+BLIP-2~\citep{li2023blip2} bridges frozen image encoders and large language models through a lightweight Querying Transformer, enabling visual question answering without task-specific fine-tuning.
+We use both models as off-the-shelf tools for automated labeling---CLIP for fixed-vocabulary classification and BLIP-2 for open-ended captioning.
+
+
+%% ============================================================
+\section{Method}
+\label{sec:method}
+%% ============================================================
+
+Our pipeline consists of three stages: direction discovery, edit generation, and automated labeling.
+Figure~\ref{fig:edit_grid} shows representative output from the full pipeline.
+
+\subsection{Stage 1: Direction Discovery}
+\label{sec:stage1}
+
+Following~\citet{haas2024discovering}, we extract semantic directions from the bottleneck activations of a pre-trained unconditional DDPM.
+
+Let $f_\theta$ denote a U-Net denoiser with bottleneck (mid-block) activations $h_t \in \mathbb{R}^{C \times H \times W}$ at diffusion timestep $t$.
+For $N$ random seeds, we run the full DDIM reverse process with $T$ steps, collecting activations $\{h_t^{(i)}\}_{i=1}^{N}$ at each timestep.
+
+For each timestep $t$, we flatten $h_t^{(i)}$ to a vector in $\mathbb{R}^{CHW}$ and fit Incremental PCA~\citep{pedregosa2011scikit} with batch size $B$ to extract $K$ principal components:
+\begin{equation}
+    v_k^{(t)} = \text{PCA}_k\big(\{h_t^{(1)}, \ldots, h_t^{(N)}\}\big), \quad k = 1, \ldots, K.
+\end{equation}
+The full direction for component $k$ is the sequence $v_k = (v_k^{(1)}, \ldots, v_k^{(T)}) \in \mathbb{R}^{T \times C \times H \times W}$.
+
+In our experiments, the bottleneck has $C{=}512$, $H{=}W{=}8$ (for 256$\times$256 generation), so each flattened activation is $32{,}768$-dimensional.
+We use $N{=}500$ samples, $K{=}20$ components, $T{=}50$ DDIM steps, and batch size $B{=}50$.
+
+\subsection{Stage 2: Edit Generation}
+\label{sec:stage2}
+
+Given a direction $v_k$ and edit strength $\alpha > 0$, we generate a triplet $(I_\text{orig}, I_\text{pos}, I_\text{neg})$ from a fixed seed $s$:
+\begin{align}
+    I_\text{orig} &= \text{DDIM}(x_T^{(s)}), \\
+    I_\text{pos} &= \text{DDIM}(x_T^{(s)};\ h_t \leftarrow h_t + \alpha \cdot v_k^{(t)}), \\
+    I_\text{neg} &= \text{DDIM}(x_T^{(s)};\ h_t \leftarrow h_t - \alpha \cdot v_k^{(t)}),
+\end{align}
+where $x_T^{(s)}$ is the initial noise determined by seed $s$, and the notation $h_t \leftarrow h_t + \delta$ indicates adding $\delta$ to the bottleneck output at timestep $t$ via a forward hook on the U-Net mid-block.
+
+All three images share the same initial noise and diffusion trajectory up to the bottleneck modification, ensuring that differences between $I_\text{pos}$ and $I_\text{neg}$ reflect the semantic content of $v_k$ rather than stochastic variation.
+We use deterministic DDIM ($\eta{=}0$) for this reason (see Section~\ref{sec:eta} for analysis of the effect of $\eta$).
+
+\subsection{Stage 3A: CLIP Zero-Shot Classification}
+\label{sec:clip}
+
+We define a vocabulary of $M{=}20$ candidate attributes $\{a_1, \ldots, a_M\}$ expressed as natural language phrases (e.g., ``a smiling person'', ``a person with blonde hair'').
+For each attribute $a_j$, we compute the logit-scaled CLIP similarity delta:
+\begin{equation}
+    \Delta S_{k,j} = \lambda \cdot \big[\cos(f_I(I_\text{pos}), f_T(a_j)) - \cos(f_I(I_\text{neg}), f_T(a_j))\big],
+\end{equation}
+where $f_I$ and $f_T$ are the CLIP image and text encoders, $\cos(\cdot, \cdot)$ denotes cosine similarity, and $\lambda = \exp(\tau)$ is CLIP's learned logit scale ($\lambda \approx 100$ for ViT-B/32).
+
+We average $\Delta S_{k,j}$ over $S{=}5$ seeds per direction.
+The top label for direction $k$ is:
+\begin{equation}
+    \hat{a}_k = \arg\max_{j} |\overline{\Delta S}_{k,j}|.
+\end{equation}
+The sign of $\overline{\Delta S}_{k,\hat{a}_k}$ indicates the polarity: positive means the attribute increases from negative to positive edit.
+
+\paragraph{Specific-label heuristic.}
+We observe that ``a female person'' and ``a male person'' dominate the top label for many directions due to the strong correlation of gender with other facial attributes in CelebA-HQ.
+To address this, we define a \emph{specific label} by excluding gender attributes from the ranking and selecting the next highest-scoring attribute.
+
+\subsection{Stage 3B: VLM Difference Captioning}
+\label{sec:vlm}
+
+As a complementary open-ended approach, we use BLIP-2~\citep{li2023blip2} to independently describe $I_\text{pos}$ and $I_\text{neg}$ through targeted visual question answering prompts such as ``Describe this person's appearance briefly.''
+We then extract content words from each caption (removing stop words), compute the set difference between positive and negative captions across seeds, and report frequently gained/lost words as the consensus label.
+
+
+%% ============================================================
+\section{Experiments}
+\label{sec:experiments}
+%% ============================================================
+
+\subsection{Setup}
+
+\paragraph{Model.}
+We use the pre-trained \texttt{google/ddpm-celebahq-256} model from the Hugging Face \texttt{diffusers} library, an unconditional DDPM trained on CelebA-HQ~\citep{karras2018progressive} at $256 \times 256$ resolution.
+The U-Net has a mid-block with 512 channels and $8 \times 8$ spatial resolution.
+
+\paragraph{Sampling.}
+We use a DDIM scheduler~\citep{song2021denoising} with $T{=}50$ steps.
+Our primary results use $\eta{=}0$ (deterministic DDIM); we also compare against $\eta{=}1$ (stochastic DDPM) in Section~\ref{sec:eta}.
+
+\paragraph{Direction discovery.}
+We collect bottleneck activations from $N{=}500$ samples and fit Incremental PCA with $K{=}20$ components using batch size 50.
+
+\paragraph{Edit generation.}
+For the main experiments, we generate edit triplets for the top $K'{=}10$ directions using $S{=}5$ seeds (42, 123, 256, 789, 1024) at $\alpha{=}5.0$.
+
+\paragraph{CLIP labeling.}
+We use OpenCLIP~\citep{ilharco2021openclip} ViT-B/32 pre-trained on OpenAI's CLIP data.
+The attribute vocabulary consists of 20 phrases covering rotation, expression, gender, accessories, age, hair properties, and eye/mouth state (full list in Appendix~\ref{app:attributes}).
+
+\paragraph{VLM labeling.}
+We use BLIP-2 with the OPT-2.7B language model backbone~\citep{li2023blip2}, loaded from the Hugging Face Hub (\texttt{Salesforce/blip2-opt-2.7b}).
+
+\subsection{Experiment 1: PCA Direction Discovery}
+\label{sec:exp1}
+
+We verify that PCA on $h$-space activations recovers meaningful semantic directions.
+Figure~\ref{fig:pca_variance} shows the explained variance ratio for the top 20 components.
+The first component explains 5.70\% of variance (averaged over timesteps), and the top 10 components together explain 29.4\%.
+The low per-component variance is expected: the $h$-space is $32{,}768$-dimensional, and many directions encode subtle or localized variations.
+21 components are needed to capture 90\% of the variance.
+
+Appendix~\ref{app:timestep} shows how PC0's explained variance varies across timesteps.
+The variance is concentrated in early-to-mid timesteps (indices 0--25), consistent with the finding of~\citet{haas2024discovering} that coarse semantic structure is determined early in the reverse process.
+
+\subsection{Experiment 2: CLIP-Based Labeling}
+\label{sec:exp2}
+
+Table~\ref{tab:clip_labels} reports the CLIP labeling results for the top 10 directions.
+The mean absolute CLIP delta score across directions is $|\overline{\Delta S}| = 0.470$, with a standard deviation of 0.224.
+The top direction (PC0) achieves the strongest score ($|\Delta S| = 0.872$) and is labeled ``a female person'', reflecting a gender/appearance axis that is the dominant mode of variation in CelebA-HQ.
+
+\paragraph{Label diversity.}
+Out of 10 directions, only 5 unique labels are assigned.
+``A female person'' appears 5 times, reflecting the strong entanglement of gender with other attributes (hair color, hair length, facial structure).
+The specific-label heuristic (which excludes gender from the ranking) assigns ``a person with blonde hair'' as the specific label for most gender-dominated directions, revealing the correlated attribute.
+
+\paragraph{Per-seed consistency.}
+The top label for PC0 is consistent across only 2 out of 5 seeds (40\%), indicating that while the mean delta is large, individual seeds may show different dominant attributes depending on the face identity being edited.
+Lower-scoring directions (e.g., PC9 with $|\Delta S| = 0.147$) show even less consistency.
+Figure~\ref{fig:seed_consistency} visualizes the consistency across all directions.
+This low agreement rate (averaging $\sim$20\% across directions) highlights a fundamental challenge: the same $h$-space perturbation produces different perceptual effects on different face identities, and CLIP's attribute ranking is sensitive to these identity-specific variations.
+
+\subsection{Experiment 3: VLM Difference Captioning}
+\label{sec:exp3}
+
+BLIP-2 captions for each direction are reported in the appendix.
+The VLM approach produces verbose, image-specific descriptions that capture fine-grained details (e.g., ``a woman with blonde hair and green eyes'') but struggle to distill the consistent semantic change across seeds.
+The consensus labeling (Section~\ref{sec:vlm}) extracts gained/lost words; for example, PC0's consensus label is ``+necklace, hair, green, eye, blonde / $-$glow, way, hand, long, beard'', which partially captures the gender-related transformation but mixes in irrelevant details.
+
+The VLM approach is more expressive than CLIP's fixed vocabulary but less reliable for automated labeling: it requires aggregation heuristics to extract a single label from heterogeneous captions.
+We view it as a useful diagnostic complement rather than a standalone labeling method.
+
+\subsection{Experiment 4: Sensitivity to Edit Strength}
+\label{sec:exp4}
+
+We vary the edit strength $\alpha \in \{1, 2, 3, 5, 7, 10\}$ and measure the CLIP labeling confidence for the top 5 directions using 3 seeds per direction.
+Figure~\ref{fig:alpha_sensitivity} shows that:
+\begin{enumerate}
+    \item CLIP confidence increases monotonically with $\alpha$: mean $|\Delta S|$ rises from 0.090 at $\alpha{=}1$ to 0.450 at $\alpha{=}10$.
+    \item The relationship is approximately logarithmic, with diminishing returns above $\alpha{=}5$.
+    \item Individual directions exhibit different sensitivity curves, with some (e.g., PC3: ``bald person'') reaching saturation earlier.
+\end{enumerate}
+At $\alpha{=}1$, no direction achieves $|\Delta S| > 0.15$, making automated labeling unreliable.
+At $\alpha{=}10$, the edits may introduce visual artifacts, though the CLIP score continues to increase.
+We recommend $\alpha \in [3, 7]$ as the operating range for reliable labeling.
+
+\subsection{Effect of Sampling Stochasticity ($\eta$)}
+\label{sec:eta}
+
+Table~\ref{tab:eta_comparison} compares CLIP labeling results under deterministic ($\eta{=}0$) and stochastic ($\eta{=}1$) sampling.
+
+Deterministic DDIM ($\eta{=}0$) produces:
+\begin{itemize}
+    \item Higher mean confidence: $|\overline{\Delta S}| = 0.470$ vs.\ $0.227$ ($2.1\times$).
+    \item Lower label diversity: 5 unique labels vs.\ 9 unique labels.
+\end{itemize}
+
+Stochastic DDPM ($\eta{=}1$) assigns a wider variety of labels (including ``smiling'', ``glasses'', ``bald'', ``hat'') but with weaker confidence scores, because stochastic noise in the sampling process partially masks the effect of the $h$-space edit.
+
+This creates a diversity-confidence trade-off: deterministic sampling gives clean, high-confidence labels but many directions collapse to the same dominant attribute (gender), while stochastic sampling reveals more diverse attributes at the cost of noisier scores.
+A practical strategy is to use $\eta{=}0$ with the specific-label heuristic to get both high confidence and attribute diversity.
+
+
+%% ============================================================
+\section{Results}
+\label{sec:results}
+%% ============================================================
+
+\begin{table}[t]
+\caption{CLIP labeling results for the top 10 $h$-space directions (DDIM, $\eta{=}0$, $\alpha{=}5.0$). $\Delta S$ is the logit-scaled CLIP similarity delta averaged over 5 seeds. Specific label excludes gender attributes.}
+\label{tab:clip_labels}
+\centering
+\small
+\begin{tabular}{@{}clrc@{\hskip 6pt}lr@{}}
+\toprule
+PC & Top Label & $\Delta S$ & & Specific Label & $\Delta S$ \\
+\midrule
+0 & female & $-0.872$ & & blonde hair & $-0.731$ \\
+1 & blonde hair & $-0.169$ & & blonde hair & $-0.169$ \\
+2 & female & $-0.778$ & & blonde hair & $-0.634$ \\
+3 & female & $-0.587$ & & blonde hair & $-0.444$ \\
+4 & female & $+0.344$ & & blonde hair & $+0.216$ \\
+5 & long hair & $-0.359$ & & long hair & $-0.359$ \\
+6 & blonde hair & $-0.553$ & & blonde hair & $-0.553$ \\
+7 & bangs & $-0.438$ & & bangs & $-0.438$ \\
+8 & female & $+0.456$ & & blonde hair & $+0.419$ \\
+9 & rotated left & $-0.147$ & & rotated left & $-0.147$ \\
+\midrule
+\multicolumn{2}{l}{Mean $|\Delta S|$} & 0.470 & & & 0.411 \\
+\multicolumn{2}{l}{Unique labels} & 5/10 & & & 4/10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\begin{table}[t]
+\caption{Effect of sampling stochasticity on CLIP labeling. $\eta{=}0$ (DDIM) vs.\ $\eta{=}1$ (DDPM), $\alpha{=}5.0$.}
+\label{tab:eta_comparison}
+\centering
+\small
+\begin{tabular}{@{}clrclr@{}}
+\toprule
+& \multicolumn{2}{c}{$\eta = 0$ (DDIM)} & & \multicolumn{2}{c}{$\eta = 1$ (DDPM)} \\
+\cmidrule{2-3} \cmidrule{5-6}
+PC & Label & $|\Delta S|$ & & Label & $|\Delta S|$ \\
+\midrule
+0 & female & 0.872 & & blonde hair & 0.281 \\
+1 & blonde hair & 0.169 & & female & 0.219 \\
+2 & female & 0.778 & & smiling & 0.134 \\
+3 & female & 0.587 & & bangs & 0.291 \\
+4 & female & 0.344 & & eyes closed & 0.484 \\
+5 & long hair & 0.359 & & glasses & 0.259 \\
+6 & blonde hair & 0.553 & & bald & 0.231 \\
+7 & bangs & 0.438 & & long hair & 0.156 \\
+8 & female & 0.456 & & glasses & 0.072 \\
+9 & rotated left & 0.147 & & hat & 0.137 \\
+\midrule
+\multicolumn{2}{l}{Mean} & 0.470 & & & 0.227 \\
+\multicolumn{2}{l}{Unique} & 5 & & & 9 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\caption{CLIP labeling confidence ($\text{mean } |\Delta S|$ over top 5 directions) as a function of edit strength $\alpha$.}
+\label{tab:alpha}
+\centering
+\small
+\begin{tabular}{@{}ccccccc@{}}
+\toprule
+$\alpha$ & 1.0 & 2.0 & 3.0 & 5.0 & 7.0 & 10.0 \\
+\midrule
+Mean $|\Delta S|$ & 0.090 & 0.211 & 0.237 & 0.364 & 0.406 & 0.450 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.65\textwidth]{figures/fig1_edit_grid.pdf}
+\caption{Semantic edits via $h$-space PCA directions on CelebA-HQ faces. Each row shows one PCA direction (PC0--PC4) applied to a single seed at $\alpha{=}5.0$ with DDIM ($\eta{=}0$). Left: negative edit ($-\alpha$), center: original, right: positive edit ($+\alpha$). The CLIP-assigned label is shown on the left.}
+\label{fig:edit_grid}
+\end{figure*}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig2_pca_variance.pdf}
+\caption{PCA explained variance ratio for the top 20 $h$-space components, averaged over 50 DDIM timesteps. (a) Individual component variance. (b) Cumulative variance with 90\% threshold.}
+\label{fig:pca_variance}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig3_clip_heatmap.pdf}
+\caption{CLIP similarity delta heatmap ($\Delta S$, logit-scaled) for 10 directions $\times$ 20 attributes. Black rectangles mark the top label per direction. Blue indicates positive $\Delta S$ (attribute increases with positive edit), red indicates negative.}
+\label{fig:clip_heatmap}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig4_alpha_sensitivity.pdf}
+\caption{CLIP labeling confidence vs.\ edit strength $\alpha$. (a)~Per-direction curves for the top 5 components. (b)~Mean $|\Delta S|$ with standard deviation. Confidence increases monotonically but saturates above $\alpha \approx 5$.}
+\label{fig:alpha_sensitivity}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig5_eta_comparison.pdf}
+\caption{Comparison of DDIM ($\eta{=}0$) vs.\ DDPM ($\eta{=}1$) sampling. (a)~Score magnitude per direction. (b)~Label distribution. DDIM gives higher scores but lower label diversity.}
+\label{fig:eta_comparison}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig7_seed_consistency.pdf}
+\caption{CLIP label agreement across 5 seeds for each direction. Green: $\geq$60\% agreement, orange: $\geq$40\%, red: $<$40\%. Most directions show low consistency, reflecting identity-dependent effects of $h$-space perturbations.}
+\label{fig:seed_consistency}
+\end{figure}
+
+
+%% ============================================================
+\section{Discussion}
+\label{sec:discussion}
+%% ============================================================
+
+\paragraph{Attribute entanglement.}
+The most salient finding is the prevalence of gender-related labels: 5 out of 10 directions are labeled ``a female person'' under CLIP.
+This reflects genuine entanglement in the CelebA-HQ data distribution, where gender correlates strongly with hair length, hair color, skin texture, and facial structure.
+PCA extracts the direction of maximum variance, which in this dataset is dominated by gender-correlated visual features.
+This entanglement is not unique to our approach---InterFaceGAN~\citep{shen2020interpreting} similarly observes that gender boundaries in GAN latent spaces are entangled with other attributes.
+The specific-label heuristic partially addresses this by revealing the correlated attribute (e.g., ``blonde hair''), but it cannot fully disentangle the underlying factors.
+Independent Component Analysis (ICA) or supervised disentanglement methods may be needed for cleaner separation.
+
+\paragraph{Comparison with GAN-based methods.}
+Our pipeline is conceptually analogous to applying GANSpace~\citep{harkonen2020ganspace} plus an automated labeling layer.
+The key differences are: (1) the $h$-space of diffusion models has different geometric properties than GAN intermediate layers---our directions are per-timestep, requiring aggregation across $T{=}50$ steps; (2) diffusion model edits are applied additively to the bottleneck activations rather than to the input latent code; and (3) deterministic DDIM sampling enables exact image-pair comparisons, which is impossible in unconditional stochastic generation.
+The $2.1\times$ confidence improvement from $\eta{=}0$ (Table~\ref{tab:eta_comparison}) directly demonstrates the importance of deterministic sampling for reliable automated labeling.
+
+\paragraph{CLIP vocabulary sensitivity.}
+The fixed vocabulary constrains what CLIP can detect.
+If the vocabulary omits a relevant attribute (e.g., ``background brightness''), the labeling will assign the closest available label, potentially introducing errors.
+Expanding the vocabulary helps but introduces a multiple-comparisons problem: with more candidates, chance correlations increase.
+The VLM approach avoids this issue but introduces its own challenges (caption aggregation, hallucination).
+A hybrid strategy---using CLIP for confident detections and falling back to VLM for low-confidence directions---could combine the strengths of both approaches.
+
+\paragraph{Scalability.}
+Stage 1 (PCA) takes approximately 25 minutes for 500 samples on a single GPU.
+Stage 2 (edit generation) takes approximately 30 minutes for 50 triplets.
+Stage 3 (CLIP + VLM labeling) completes in under 5 minutes.
+The entire pipeline runs in approximately 1 hour, making it practical for routine analysis of new models or datasets.
+In contrast, manual labeling of 10 directions requires generating and visually inspecting at least 30 image triplets (3 per direction with redundancy), typically taking 30--60 minutes of concentrated human effort that must be repeated for each model.
+
+\paragraph{Limitations.}
+Our evaluation is limited to CelebA-HQ faces, a domain where facial attributes are well-defined and relatively easy to detect.
+The method may be less effective on datasets with more abstract or less visually salient variations (e.g., LSUN Churches, where ``style'' or ``era'' may be harder for CLIP to distinguish).
+The per-seed consistency of CLIP labeling is low (often $\leq 40\%$ agreement; see Figure~\ref{fig:seed_consistency}), suggesting that individual faces respond differently to the same $h$-space perturbation.
+This low consistency is partly an artifact of using absolute-maximum selection: if two attributes have similar $|\Delta S|$ values, the top label may flip between seeds.
+A soft labeling scheme that reports the top-$k$ attributes with their confidence intervals would be more informative.
+Additionally, the VLM-based approach produces noisy outputs that require significant post-processing to yield a single label, and our simple word-frequency heuristic for consensus extraction is limited compared to what a more sophisticated NLP pipeline could achieve.
+
+
+%% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%% ============================================================
+
+We presented an automated pipeline for discovering and labeling semantic directions in the $h$-space of diffusion models.
+By combining PCA-based direction discovery with CLIP zero-shot classification and VLM-based captioning, we transform manually-interpreted editing directions into self-describing ones.
+Our experiments on CelebA-HQ demonstrate that CLIP can assign meaningful labels with reasonable confidence, though attribute entanglement remains a challenge.
+We characterized the effects of edit strength and sampling stochasticity on labeling quality, providing practical guidance for future applications of this pipeline.
+Future work should extend the evaluation to non-face datasets, explore disentanglement methods beyond PCA, and investigate whether larger CLIP models (e.g., ViT-L/14) improve labeling accuracy and consistency.
+
+
+%% ============================================================
+\bibliography{references}
+\bibliographystyle{icml2025}
+
+%% ============================================================
+\newpage
+\appendix
+
+\section{Attribute Vocabulary}
+\label{app:attributes}
+
+The 20 candidate attributes used for CLIP zero-shot classification:
+
+\begin{enumerate}
+\small
+\item a face rotated to the left
+\item a face rotated to the right
+\item a smiling person
+\item a frowning person
+\item a male person
+\item a female person
+\item a person wearing glasses
+\item a person without glasses
+\item an older person
+\item a younger person
+\item a person with blonde hair
+\item a person with dark hair
+\item a bald person
+\item a person with long hair
+\item a person with bangs
+\item a person with a hat
+\item a person with eyes closed
+\item a person with eyes open
+\item a person with mouth open
+\item a person with mouth closed
+\end{enumerate}
+
+
+\section{VLM Captioning Details}
+\label{app:vlm}
+
+BLIP-2 is prompted with three targeted visual question answering prompts per image:
+
+\begin{enumerate}
+\small
+\item ``Describe this person's appearance briefly.''
+\item ``What stands out about this person's face?''
+\item ``Describe the hair, expression, and accessories.''
+\end{enumerate}
+
+The consensus label is computed by extracting content words (nouns, adjectives, verbs) from each caption, computing set differences between positive and negative images across all seeds, and reporting words that appear in at least $\lfloor S/3 \rfloor$ seed comparisons (where $S$ is the number of seeds).
+
+Representative VLM consensus labels:
+\begin{itemize}
+\small
+\item PC0: +necklace, hair, green, eye, blonde / $-$glow, way, hand, long, beard
+\item PC1: +short, woman, dress, blouse, wearing / $-$blonde, green, hair, think
+\item PC5: +woman, dark, hair / $-$blonde, man
+\end{itemize}
+
+
+\section{PCA Variance by Timestep}
+\label{app:timestep}
+
+Figure~\ref{fig:variance_timestep_app} shows the explained variance for the top 5 components as a function of the DDIM timestep index.
+Early timesteps (high noise level) show the most structured variation, consistent with the observation that coarse semantic structure is determined early in the reverse diffusion process~\citep{haas2024discovering, kwon2023diffusion}.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.9\columnwidth]{figures/fig8_variance_timestep.pdf}
+\caption{Explained variance ratio by DDIM timestep for the top 5 principal components.}
+\label{fig:variance_timestep_app}
+\end{figure}
+
+\section{Edit Magnitude Analysis}
+\label{app:edit_magnitude}
+
+Figure~\ref{fig:edit_magnitude_app} shows the mean L2 pixel difference between edited and original images for each direction.
+PC0 shows the largest edit magnitude (mean L2 $\approx 2.80$), consistent with it capturing the most variance.
+Positive and negative edits produce similar magnitudes, confirming the symmetry of linear $h$-space perturbations.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.9\columnwidth]{figures/fig6_edit_magnitude.pdf}
+\caption{Mean L2 pixel difference between edited and original images for each direction.}
+\label{fig:edit_magnitude_app}
+\end{figure}
+
+
+\section{Implementation Details}
+\label{app:implementation}
+
+The pipeline is implemented in Python using:
+\begin{itemize}
+\small
+\item \textbf{diffusers}~\citep{wolf2020transformers}: DDPM model loading and DDIM scheduling
+\item \textbf{scikit-learn}~\citep{pedregosa2011scikit}: Incremental PCA
+\item \textbf{OpenCLIP}~\citep{ilharco2021openclip}: CLIP ViT-B/32
+\item \textbf{transformers}~\citep{wolf2020transformers}: BLIP-2 model loading
+\end{itemize}
+
+The U-Net bottleneck hook intercepts the output of \texttt{unet.mid\_block} via PyTorch's \texttt{register\_forward\_hook} API.
+In ``capture'' mode, it records activations; in ``edit'' mode, it adds $\alpha \cdot v_k^{(t)}$ to the output tensor at each timestep.
+
+All experiments were run on NVIDIA H100 80GB GPUs.
+The full pipeline (Stage 1: PCA + Stage 2: edits + Stage 3: labeling) completes in approximately 60 minutes.
+
+The complete codebase is available at \url{https://github.com/ramzzes13/direction-in-latent}.
+
+\end{document}

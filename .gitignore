@@ -3,3 +3,14 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 *.egg-info/
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+paper/icml2025/
+paper/icml2025.zip
+.DS_Store
