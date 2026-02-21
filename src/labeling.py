@@ -115,6 +115,21 @@ class CLIPLabeler:
             top_pos_idx = int(np.argmax(mean_delta))
             top_neg_idx = int(np.argmin(mean_delta))
 
+            # Ranked list (top-3 by absolute delta)
+            ranked_indices = np.argsort(abs_delta)[::-1]
+            top3 = [
+                {"label": attributes[int(i)], "score": float(mean_delta[int(i)])}
+                for i in ranked_indices[:3]
+            ]
+
+            # Specific label: exclude overly broad gender attributes
+            broad_attrs = {"a male person", "a female person"}
+            specific_idx = top_idx
+            for i in ranked_indices:
+                if attributes[int(i)] not in broad_attrs:
+                    specific_idx = int(i)
+                    break
+
             results[f"direction_{k}"] = {
                 "scores": {attr: float(mean_delta[i])
                            for i, attr in enumerate(attributes)},
@@ -123,6 +138,9 @@ class CLIPLabeler:
                 "top_label": attributes[top_idx],
                 "top_score": float(mean_delta[top_idx]),
                 "top_abs_score": float(abs_delta[top_idx]),
+                "specific_label": attributes[specific_idx],
+                "specific_score": float(mean_delta[specific_idx]),
+                "top3": top3,
                 "top_positive": {
                     "label": attributes[top_pos_idx],
                     "score": float(mean_delta[top_pos_idx]),

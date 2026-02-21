@@ -37,10 +37,11 @@ def analyze_clip_scores(clip_results, output_dir):
     attributes = list(clip_results[directions[0]]["scores"].keys())
 
     # Print detailed scores table
-    print(f"\n{'Direction':<15} {'Top Label':<30} {'Score':>8} {'|Score|':>8}")
-    print("-" * 65)
+    print(f"\n{'Direction':<15} {'Top Label':<30} {'Score':>8} {'Specific Label':<30} {'Score':>8}")
+    print("-" * 95)
 
     labels_assigned = []
+    specific_labels = []
     abs_scores = []
 
     for d in directions:
@@ -48,11 +49,21 @@ def analyze_clip_scores(clip_results, output_dir):
         label = entry["top_label"]
         score = entry["top_score"]
         abs_score = entry.get("top_abs_score", abs(score))
+        spec_label = entry.get("specific_label", label)
+        spec_score = entry.get("specific_score", score)
         labels_assigned.append(label)
+        specific_labels.append(spec_label)
         abs_scores.append(abs_score)
 
         short_label = label[:28]
-        print(f"{d:<15} {short_label:<30} {score:>+8.4f} {abs_score:>8.4f}")
+        short_spec = spec_label[:28]
+        print(f"{d:<15} {short_label:<30} {score:>+8.4f} {short_spec:<30} {spec_score:>+8.4f}")
+
+        # Print top-3 if available
+        top3 = entry.get("top3", [])
+        if top3:
+            top3_str = ", ".join(f"{t['label'][:20]} ({t['score']:+.3f})" for t in top3)
+            print(f"{'':>15} Top-3: {top3_str}")
 
     # Label diversity
     unique_labels = set(labels_assigned)
@@ -265,7 +276,11 @@ def create_summary_report(clip_analysis, vlm_analysis, edit_quality,
             "clip_label": clip_results[d]["top_label"],
             "clip_score": clip_results[d]["top_score"],
             "clip_abs_score": clip_results[d].get("top_abs_score", abs(clip_results[d]["top_score"])),
+            "specific_label": clip_results[d].get("specific_label", clip_results[d]["top_label"]),
+            "specific_score": clip_results[d].get("specific_score", clip_results[d]["top_score"]),
         }
+        if "top3" in clip_results[d]:
+            entry["top3"] = clip_results[d]["top3"]
         if "top_positive" in clip_results[d]:
             entry["clip_positive"] = clip_results[d]["top_positive"]
             entry["clip_negative"] = clip_results[d]["top_negative"]
@@ -276,15 +291,16 @@ def create_summary_report(clip_analysis, vlm_analysis, edit_quality,
     save_json(report, os.path.join(analysis_dir, "analysis_report.json"))
 
     # Print final direction assignments
-    print(f"\n{'PC':<6} {'CLIP Label':<30} {'Score':>8} {'VLM Label':<30}")
-    print("-" * 78)
+    print(f"\n{'PC':<6} {'CLIP Label':<30} {'Score':>8} {'Specific Label':<30} {'VLM Label':<25}")
+    print("-" * 105)
     for d in sorted(report["direction_labels"].keys()):
         entry = report["direction_labels"][d]
         pc = d.replace("direction_", "")
         clip_l = entry["clip_label"][:28]
         score = entry["clip_score"]
-        vlm_l = entry.get("vlm_label", "N/A")[:28]
-        print(f"PC{pc:<4} {clip_l:<30} {score:>+8.4f} {vlm_l:<30}")
+        spec_l = entry.get("specific_label", clip_l)[:28]
+        vlm_l = entry.get("vlm_label", "N/A")[:23]
+        print(f"PC{pc:<4} {clip_l:<30} {score:>+8.4f} {spec_l:<30} {vlm_l:<25}")
 
     print(f"\nAnalysis complete. Report saved to {analysis_dir}/analysis_report.json")
     return report
