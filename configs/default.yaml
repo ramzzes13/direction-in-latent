@@ -5,7 +5,7 @@ model:
 
 sampler:
   num_inference_steps: 50
-  eta: 1.0
+  eta: 0.0  # 0.0=deterministic DDIM (cleaner edits), 1.0=stochastic DDPM
 
 discovery:
   num_samples: 500
