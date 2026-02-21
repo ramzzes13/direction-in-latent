@@ -31,12 +31,23 @@ Started: Sat Feb 21 09:43:48 PM MSK 2026
   - All table entries verified exact match
 - Paper compiles cleanly with pdflatex+bibtex (no errors)
 
-## What remains:
-- Nothing critical. All goals from research plan achieved:
-  1. Direction Discovery (PCA on h-space) - DONE
-  2. Edit Generation (pos/neg image pairs) - DONE
-  3. Automated Labeling (CLIP + VLM) - DONE
-  4. Evaluation (alpha sensitivity, eta comparison, seed consistency) - DONE
-  5. Full ICML paper written with real data - DONE
+## Iteration 3: Review (Feb 21)
+- Automated review identified 2 factual errors requiring fixes:
+  1. BUG: "21 components for 90% variance" in Section 4.2 — WRONG.
+     20 components explain only 38.9% of total variance.
+     Bug in run_analysis.py:242 (np.searchsorted on cumsum that never reaches 0.9).
+  2. INCONSISTENCY: PC3 labeled "bald person" in Section 4.4 but
+     Table 1 shows PC3 as "female" (ΔS = -0.587).
+- All other numbers verified correct (tables, figures, citations).
+- Full review written to review.txt.
 
-<promise>COMPLETE</promise>
+## What remains (MUST FIX for PASS):
+  1. Fix "21 components for 90%" claim in paper/main.tex Section 4.2
+  2. Fix run_analysis.py:242 searchsorted bug
+  3. Fix PC3 label inconsistency in paper/main.tex Section 4.4
+  4. [SHOULD] Add note about different seed sets in alpha experiment
+  5. [SHOULD] Acknowledge specific-label diversity reduction
+  6. [MINOR] Remove [accepted] option from icml2025 usepackage
+  7. [MINOR] Remove unused chefer2023attend from references.bib
+  8. Recompile paper and re-run analysis after fixes
+  9. Re-verify and mark COMPLETE only after all fixes applied
